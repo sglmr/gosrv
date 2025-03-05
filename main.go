@@ -12,24 +12,70 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
-	"github.com/gorilla/websocket"
 )
 
 var (
 	addr      = flag.String("addr", ":8080", "HTTP service address")
 	directory = flag.String("dir", "./", "Directory to serve")
-	clients   = make(map[*websocket.Conn]bool)
+	clients   = make(map[chan bool]bool)
 	clientsMu sync.Mutex
-	upgrader  = websocket.Upgrader{
-		ReadBufferSize:  1024,
-		WriteBufferSize: 1024,
-		CheckOrigin: func(r *http.Request) bool {
-			return true // Allow all connections
-		},
-	}
 )
 
-// injectLiveReload modifies HTML files to include the WebSocket client
+// EventSource handler for live reload
+func handleEventSource(w http.ResponseWriter, r *http.Request) {
+	// Set headers for SSE (Server-Sent Events)
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	// Create a channel for this client
+	messageChan := make(chan bool)
+
+	// Register new client
+	clientsMu.Lock()
+	clients[messageChan] = true
+	clientsMu.Unlock()
+
+	// Remove client when disconnected
+	defer func() {
+		clientsMu.Lock()
+		delete(clients, messageChan)
+		close(messageChan)
+		clientsMu.Unlock()
+	}()
+
+	// Set a timeout for the connection
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	// Keep connection alive
+	notify := w.(http.CloseNotifier).CloseNotify()
+
+	// Send initial connection message
+	fmt.Fprintf(w, "event: connected\ndata: %d\n\n", time.Now().Unix())
+	flusher.Flush()
+
+	// Wait for messages or connection close
+	for {
+		select {
+		case <-notify:
+			return
+		case <-messageChan:
+			fmt.Fprintf(w, "event: reload\ndata: %d\n\n", time.Now().Unix())
+			flusher.Flush()
+		case <-time.After(25 * time.Second):
+			// Send keep-alive comment to keep connection open
+			fmt.Fprintf(w, ": keepalive %d\n\n", time.Now().Unix())
+			flusher.Flush()
+		}
+	}
+}
+
+// injectLiveReload modifies HTML files to include the EventSource client
 func injectLiveReload(w http.ResponseWriter, r *http.Request, path string) {
 	content, err := os.ReadFile(path)
 	if err != nil {
@@ -37,23 +83,24 @@ func injectLiveReload(w http.ResponseWriter, r *http.Request, path string) {
 		return
 	}
 
-	// Create JavaScript for live reload
+	// Create JavaScript for live reload using EventSource
 	liveReloadScript := `
 <script>
     (function() {
-        const socket = new WebSocket('ws://' + window.location.host + '/ws');
+        const evtSource = new EventSource('/events');
         
-        socket.onopen = function() {
+        evtSource.addEventListener('connected', function(e) {
             console.log('Live reload connected');
-        };
+        });
         
-        socket.onmessage = function(msg) {
-            console.log('Live reload triggered:', msg.data);
+        evtSource.addEventListener('reload', function(e) {
+            console.log('Live reload triggered:', e.data);
             window.location.reload();
-        };
+        });
         
-        socket.onclose = function() {
+        evtSource.onerror = function() {
             console.log('Live reload disconnected');
+            evtSource.close();
             // Try to reconnect every 2 seconds
             setTimeout(function() {
                 window.location.reload();
@@ -124,50 +171,18 @@ func FileServerWithLiveReload(dir string) http.Handler {
 	})
 }
 
-// handleWebSocket handles the WebSocket connection for live reload
-func handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Println("WebSocket upgrade error:", err)
-		return
-	}
-	defer conn.Close()
-
-	// Register new client
-	clientsMu.Lock()
-	clients[conn] = true
-	clientsMu.Unlock()
-
-	// Remove client when disconnected
-	defer func() {
-		clientsMu.Lock()
-		delete(clients, conn)
-		clientsMu.Unlock()
-	}()
-
-	// Keep connection alive
-	for {
-		// Read messages (not really needed, but keeps the connection open)
-		_, _, err := conn.ReadMessage()
-		if err != nil {
-			break
-		}
-	}
-}
-
-// notifyClients sends a reload message to all WebSocket clients
+// notifyClients sends a reload message to all EventSource clients
 func notifyClients() {
-	message := []byte(fmt.Sprintf("reload:%d", time.Now().Unix()))
-
 	clientsMu.Lock()
 	defer clientsMu.Unlock()
 
 	for client := range clients {
-		err := client.WriteMessage(websocket.TextMessage, message)
-		if err != nil {
-			log.Printf("Error writing to client: %v", err)
-			client.Close()
-			delete(clients, client)
+		// Non-blocking send
+		select {
+		case client <- true:
+			// Successfully sent
+		default:
+			// Channel full or closed, will be cleaned up on next cycle
 		}
 	}
 }
@@ -257,7 +272,7 @@ func main() {
 
 	// Setup handlers
 	http.Handle("/", FileServerWithLiveReload(absDir))
-	http.HandleFunc("/ws", handleWebSocket)
+	http.HandleFunc("/events", handleEventSource)
 
 	// Start the server
 	log.Printf("Starting development server at http://localhost%s serving directory %s", *addr, absDir)
