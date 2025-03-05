@@ -25,10 +25,10 @@ go run main.go
 go run main.go -addr=:3000
 
 # Specify a different directory to serve
-go run main.go -dir=./public
+go run main.go -dir=./demo
 
 # Specify both
-go run main.go -addr=:3000 -dir=./public
+go run main.go -addr=:3000 -dir=./demo
 ```
 
 ## How It Works
