@@ -11,9 +11,16 @@ GoSrv is a lightweight, zero-dependency development server for static web projec
 
 ## Installation
 
-1. Ensure you have Go installed (version 1.16 or later recommended)
-2. Download the `main.go` file or clone this repository
-3. Run the server with `go run main.go`
+### Global Installation
+To install GoSrv globally and use it from any directory:
+
+```bash
+# Build and install
+go install
+
+# Now you can run it from any directory
+gosrv
+```
 
 ## Usage
 
