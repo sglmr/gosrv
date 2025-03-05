@@ -10,8 +10,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/fsnotify/fsnotify"
 )
 
 var (
@@ -20,6 +18,12 @@ var (
 	clients   = make(map[chan bool]bool)
 	clientsMu sync.Mutex
 )
+
+// FileInfo stores the file path and its last modification time
+type FileInfo struct {
+	Path    string
+	ModTime time.Time
+}
 
 // EventSource handler for live reload
 func handleEventSource(w http.ResponseWriter, r *http.Request) {
@@ -187,73 +191,76 @@ func notifyClients() {
 	}
 }
 
-// watchForChanges watches for file changes in the directory
-func watchForChanges(dir string) {
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		log.Fatal("Failed to create file watcher:", err)
-	}
-	defer watcher.Close()
+// scanDirectory scans a directory and returns a map of files with their modification times
+func scanDirectory(dir string) (map[string]time.Time, error) {
+	fileMap := make(map[string]time.Time)
 
-	// Add directory to watch
-	err = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 
-		// Skip .git, node_modules, and other hidden directories
-		if info.IsDir() {
-			basename := filepath.Base(path)
-			if basename[0] == '.' || basename == "node_modules" {
+		// Skip hidden files and directories and node_modules
+		basename := filepath.Base(path)
+		if basename[0] == '.' || basename == "node_modules" {
+			if info.IsDir() {
 				return filepath.SkipDir
 			}
-			return watcher.Add(path)
+			return nil
 		}
+
+		// Store the file's path and modification time
+		fileMap[path] = info.ModTime()
 		return nil
 	})
+
+	return fileMap, err
+}
+
+// watchDirectoryForChanges periodically scans the directory for changes
+func watchDirectoryForChanges(dir string, interval time.Duration) {
+	// Initial scan of the directory
+	prevFiles, err := scanDirectory(dir)
 	if err != nil {
-		log.Fatal("Failed to walk directory:", err)
+		log.Fatal("Failed to scan directory:", err)
 	}
 
-	// Create a debouncer to prevent multiple reloads at once
-	var lastEvent time.Time
+	// Periodically scan the directory for changes
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
 
-	for {
-		select {
-		case event, ok := <-watcher.Events:
-			if !ok {
-				return
+	for range ticker.C {
+		currentFiles, err := scanDirectory(dir)
+		if err != nil {
+			log.Println("Error scanning directory:", err)
+			continue
+		}
+
+		changes := false
+
+		// Check for new or modified files
+		for path, modTime := range currentFiles {
+			prevModTime, exists := prevFiles[path]
+			if !exists || modTime.After(prevModTime) {
+				log.Println("File changed:", path)
+				changes = true
 			}
+		}
 
-			// Skip temporary files and directories we don't care about
-			if strings.HasSuffix(event.Name, "~") || strings.HasSuffix(event.Name, ".tmp") {
-				continue
+		// Check for deleted files
+		for path := range prevFiles {
+			if _, exists := currentFiles[path]; !exists {
+				log.Println("File deleted:", path)
+				changes = true
 			}
+		}
 
-			// Debounce events (only trigger once every 100ms)
-			if time.Since(lastEvent) < 100*time.Millisecond {
-				continue
-			}
-			lastEvent = time.Now()
+		// Update the previous files map
+		prevFiles = currentFiles
 
-			log.Println("File changed:", event.Name)
-
-			// If a directory was created, watch it too
-			if event.Op&fsnotify.Create == fsnotify.Create {
-				info, err := os.Stat(event.Name)
-				if err == nil && info.IsDir() {
-					watcher.Add(event.Name)
-				}
-			}
-
-			// Notify clients to reload
+		// Notify clients if there were changes
+		if changes {
 			notifyClients()
-
-		case err, ok := <-watcher.Errors:
-			if !ok {
-				return
-			}
-			log.Println("Watcher error:", err)
 		}
 	}
 }
@@ -268,7 +275,8 @@ func main() {
 	}
 
 	// Start file watcher in a goroutine
-	go watchForChanges(absDir)
+	// Poll for changes every 500ms
+	go watchDirectoryForChanges(absDir, 500*time.Millisecond)
 
 	// Setup handlers
 	http.Handle("/", FileServerWithLiveReload(absDir))
